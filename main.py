@@ -59,7 +59,7 @@ def index():
 
 def get_historical(quote):
     end = datetime.now()
-    start = end - timedelta(days=1460)  # 4 years
+    start = end - timedelta(days=1440)  # 4 years
     try:
         data = yf.download(quote, start=start, end=end, progress=False, auto_adjust=True)
         if data.empty:
@@ -247,12 +247,20 @@ def build_ratio_features(price_df, ticker):
 
 # ------------------------------ Models ------------------------------
 def ARIMA_ALGO(df, quote):
+    """
+    Advanced ARIMA algorithm with automatic order selection, walk-forward validation,
+    and overfitting prevention using cross-validation and model order constraints.
+    """
     try:
-        import pmdarima as pm
-        from statsmodels.tsa.stattools import adfuller
+        from statsmodels.tsa.arima.model import ARIMA
         from statsmodels.stats.diagnostic import acorr_ljungbox
-        
-        # Ensure data is numeric and properly formatted
+        from sklearn.metrics import mean_squared_error
+        import pandas as pd
+        import numpy as np
+        import math
+        import matplotlib.pyplot as plt
+
+        # 1. DATA PREPROCESSING
         df_close = df[['Close']].copy().dropna()
         df_close['Close'] = pd.to_numeric(df_close['Close'], errors='coerce')
         df_close = df_close.dropna()
@@ -262,124 +270,95 @@ def ARIMA_ALGO(df, quote):
         train_size = int(len(df_close) * 0.8)
         train, test = df_close[:train_size], df_close[train_size:]
 
-        # **IMPROVEMENT 1: Automatic ARIMA order selection with constraints**
-        # Limit max_p and max_q to avoid overfitting (reduced from hardcoded 5,1,0)
-        try:
-            model_auto = pm.auto_arima(
-                train['Close'], 
-                start_p=1, start_q=1, 
-                max_p=3, max_q=2,  # Conservative limits
-                d=1,  # Force differencing once for stationarity
-                seasonal=False,
-                stepwise=True, 
-                suppress_warnings=True,
-                error_action='ignore', 
-                trace=False,
-                information_criterion='aic',  # Use AIC for model selection
-                max_order=6  # Total parameters limit
-            )
-            best_order = model_auto.order
-            print(f"Auto-selected ARIMA order: {best_order}")
-        except Exception:
-            # Fallback to conservative manual selection
-            best_order = (2, 1, 1)
-            print(f"Auto-selection failed, using fallback order: {best_order}")
+        # 2. AUTOMATIC ORDER SELECTION WITH CONSTRAINTS (to avoid overly complex models)
+        print("Searching for optimal ARIMA parameters with overfitting prevention...")
+        best_aic = float('inf')
+        best_order = (1, 1, 1)  # Default fallback
 
-        # **IMPROVEMENT 2: Model validation before proceeding**
+        # Limit p, d=1, q with moderate ranges to prevent overfitting
+        max_p = 3
+        max_q = 3
+
+        for p in range(max_p + 1):
+            for q in range(max_q + 1):
+                if p == 0 and q == 0:
+                    continue  # skip trivial model
+                try:
+                    model = ARIMA(train['Close'], order=(p, 1, q))
+                    model_fit = model.fit()
+                    aic = model_fit.aic
+                    if aic < best_aic:
+                        best_aic = aic
+                        best_order = (p, 1, q)
+                except Exception:
+                    continue
+
+        print(f"Auto-selected ARIMA order: {best_order} (AIC: {best_aic:.2f})")
+
+        # 3. MODEL VALIDATION: Check residuals
+        model = ARIMA(train['Close'], order=best_order)
+        model_fit = model.fit()
         try:
-            model = ARIMA(train['Close'], order=best_order)
-            model_fit = model.fit()
-            
-            # Check residuals for white noise (basic diagnostic)
             residuals = model_fit.resid
             lb_stat, lb_pvalue = acorr_ljungbox(residuals, lags=10, return_df=False)
-            
-            if lb_pvalue < 0.05:
+            if any(p < 0.05 for p in lb_pvalue):
                 print("Warning: Residuals show autocorrelation, model may need adjustment")
-                
         except Exception as e:
-            print(f"Model validation warning: {e}")
-            # Continue with selected order anyway
+            print(f"Residual diagnostic warning: {e}")
 
-        # **IMPROVEMENT 3: Walk-forward validation with out-of-sample testing**
+        # 4. WALK-FORWARD VALIDATION WITH OVERFITTING CHECK
         forecast_values = []
         forecast_indices = []
         history = train['Close'].tolist()
-        
-        # Track training errors to compare with test errors
-        train_predictions = []
-        
+
         for i in range(len(test)):
             try:
-                # Fit model on current history
                 temp_model = ARIMA(history, order=best_order)
                 temp_fit = temp_model.fit()
-                
-                # Forecast next step
                 next_pred = temp_fit.forecast(steps=1)
-                
-                # Handle different statsmodels versions
-                if hasattr(next_pred, 'iloc'):
-                    pred_value = next_pred.iloc[0]
-                else:
-                    pred_value = next_pred if isinstance(next_pred, (list, np.ndarray)) else float(next_pred)
-                
+                pred_value = next_pred.iloc[0] if hasattr(next_pred, 'iloc') else float(next_pred)
                 forecast_values.append(pred_value)
                 forecast_indices.append(test.index[i])
-                
-                # Add actual value to history for next prediction (walk-forward)
                 history.append(test['Close'].iloc[i])
-                
             except Exception as e:
-                print(f"Forecasting step {i} failed: {e}")
-                # Use naive forecast (last observed value) as fallback
                 forecast_values.append(history[-1] if history else 0)
                 forecast_indices.append(test.index[i])
                 history.append(test['Close'].iloc[i])
 
-        # Create forecast series with proper index
         forecast = pd.Series(forecast_values, index=forecast_indices)
 
-        # **IMPROVEMENT 4: Cross-validation check for overfitting detection**
-        # Simple overfitting check: compare in-sample vs out-of-sample performance
+        # Overfitting detection: compare in-sample and out-of-sample errors
         try:
             in_sample_pred = model_fit.fittedvalues
             in_sample_error = math.sqrt(mean_squared_error(
-                train['Close'].values[1:], in_sample_pred.values[1:]  # Skip first value
+                train['Close'].values[1:], in_sample_pred.values[1:]
             ))
             out_sample_error = math.sqrt(mean_squared_error(test['Close'].values, forecast.values))
-            
             overfitting_ratio = out_sample_error / in_sample_error if in_sample_error > 0 else float('inf')
             if overfitting_ratio > 2.0:
                 print(f"Warning: Potential overfitting detected (ratio: {overfitting_ratio:.2f})")
-                
-        except Exception:
-            print("Could not calculate overfitting metrics")
-
-        # Generate final prediction for next day
-        try:
-            full_model = ARIMA(df_close['Close'], order=best_order)
-            full_model_fit = full_model.fit()
-            next_prediction = full_model_fit.forecast(steps=1)
-            
-            # Handle prediction output format
-            if hasattr(next_prediction, 'iloc'):
-                arima_pred = next_prediction.iloc[0]
+                # Apply model order adjustment to reduce complexity
+                reduced_order = (max(1, best_order[0]-1), 1, max(1, best_order[2]-1))
+                print(f"Trying reduced order to prevent overfitting: {reduced_order}")
+                try:
+                    model_reduced = ARIMA(df_close['Close'], order=reduced_order)
+                    model_reduced_fit = model_reduced.fit()
+                    next_prediction = model_reduced_fit.forecast(steps=1)
+                    arima_pred = next_prediction.iloc[0] if hasattr(next_prediction, 'iloc') else float(next_prediction)
+                    best_order = reduced_order
+                except Exception as e:
+                    print(f"Reduced order ARIMA failed: {e}")
+                    arima_pred = forecast.iloc[-1] if len(forecast) > 0 else df_close['Close'].iloc[-1]
             else:
-                arima_pred = next_prediction if isinstance(next_prediction, (list, np.ndarray)) else float(next_prediction)
+                next_prediction = model_fit.forecast(steps=1)
+                arima_pred = next_prediction.iloc[0] if hasattr(next_prediction, 'iloc') else float(next_prediction)
         except Exception:
-            # Fallback prediction
             arima_pred = forecast.iloc[-1] if len(forecast) > 0 else df_close['Close'].iloc[-1]
 
-        # Create the plot
+        # 5. VISUALIZATION
         fig = plt.figure(figsize=(7.2, 4.8), dpi=65)
-        
-        # Plot actual test values
         plt.plot(test.index, test['Close'].values, label='Actual Price', linewidth=2)
-        
-        # Plot forecasted values
         plt.plot(forecast.index, forecast.values, label='Predicted Price', color='orange', linewidth=2)
-        
         plt.legend(loc='best')
         plt.title(f'ARIMA Forecast for {quote} (Order: {best_order})')
         plt.xlabel('Date')
@@ -391,7 +370,7 @@ def ARIMA_ALGO(df, quote):
 
         # Calculate RMSE
         error_arima = math.sqrt(mean_squared_error(test['Close'].values, forecast.values))
-        
+
         print(f"ARIMA (order={best_order}) Prediction: {arima_pred:.2f}, RMSE: {error_arima:.4f}")
         return round(arima_pred, 2), round(error_arima, 4)
 
@@ -400,6 +379,7 @@ def ARIMA_ALGO(df, quote):
         import traceback
         traceback.print_exc()
         return 0, 0
+
 
 def LSTM_ALGO(df, quote):
     try:
@@ -578,21 +558,20 @@ def LSTM_ALGO(df, quote):
             lstm_pred = float(dataset['Close'].iloc[-1])
         
         # **11. VISUALIZATION**
-        fig = plt.figure(figsize=(12, 8))
-        
+        # **11. VISUALIZATION**
+        fig = plt.figure(figsize=(7.2, 4.8), dpi=65)  # Standardized size to match LR
         if len(actual_original) > 0:
-            plt.subplot(2, 1, 1)
             plt.plot(actual_original, label='Actual Price', linewidth=2, alpha=0.8)
             plt.plot(predictions_original, label='Predicted Price', color='orange', linewidth=2, alpha=0.8)
-            plt.legend()
+            plt.legend(loc='best')
             plt.title(f'Improved LSTM Forecast for {quote}')
+            plt.xlabel('Time Steps')  # Added for consistency with LR
             plt.ylabel('Price ($)')
             plt.grid(True, alpha=0.3)
-            
-        
         plt.tight_layout()
         plt.savefig('static/LSTM.png', bbox_inches='tight', dpi=100)
         plt.close(fig)
+
         
         # **12. COMPREHENSIVE LOGGING**
         print(f"\n{'='*60}")
@@ -822,25 +801,22 @@ def LIN_REG_ALGO_MULTIVAR(df, quote, ratio_feat: pd.DataFrame):
             forecast_set = [float(recent_prices)] * 7
         
         # Visualization
+        # Visualization
         try:
             fig = plt.figure(figsize=(7.2, 4.8), dpi=65)
             plt.plot(range(len(y_test)), y_test.values, label='Actual Price', linewidth=2, alpha=0.8)
             plt.plot(range(len(y_pred)), y_pred, label='Predicted Price', color='orange', linewidth=2, alpha=0.8)
-            
-            # Add forecast
-            forecast_x = range(len(y_test), len(y_test) + 7)
-            # plt.plot(forecast_x, forecast_set, label='7-Day Forecast', color='red', linewidth=2, linestyle='--', alpha=0.7)
-            
-            plt.legend(loc='best')
+            plt.legend(loc='best')  # Consistent location
             plt.title(f'Enhanced Linear Regression Forecast for {quote}\nModel: {best_model_name}')
             plt.xlabel('Time Steps')
             plt.ylabel('Price ($)')
-            plt.grid(True, alpha=0.3)
+            plt.grid(True, alpha=0.3)  # Consistent grid
             plt.tight_layout()
             plt.savefig('static/LR.png', bbox_inches='tight', dpi=100)
             plt.close(fig)
         except Exception as e:
             print(f"Plotting failed: {e}")
+
         
         # Calculate mean forecast
         mean_forecast = sum(forecast_set) / len(forecast_set) if forecast_set else 0
